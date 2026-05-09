@@ -1,0 +1,52 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Absensi;
+use Illuminate\Http\Request;
+use Symfony\Component\HttpFoundation\StreamedResponse;
+
+class LaporanController extends Controller
+{
+    public function index()
+    {
+        return view('laporan.index');
+    }
+
+    /**
+     * GET /laporan/export
+     * Export semua data absensi ke CSV.
+     * Untuk Excel (.xlsx), install: composer require maatwebsite/excel
+     * dan ganti implementasi ini dengan Excel facade.
+     */
+    public function export(): StreamedResponse
+    {
+        $filename = 'Laporan_Absensi_' . now()->format('Ymd_His') . '.csv';
+
+        return response()->streamDownload(function () {
+            $handle = fopen('php://output', 'w');
+
+            // BOM agar Excel bisa baca UTF-8
+            fwrite($handle, "\xEF\xBB\xBF");
+
+            // Header kolom
+            fputcsv($handle, ['Tanggal', 'Waktu', 'Nama', 'Status', 'Kehadiran']);
+
+            Absensi::orderBy('tanggal')->orderBy('waktu')->chunk(500, function ($rows) use ($handle) {
+                foreach ($rows as $row) {
+                    fputcsv($handle, [
+                        $row->tanggal->format('Y-m-d'),
+                        $row->waktu,
+                        $row->nama,
+                        $row->role_type,
+                        $row->status,
+                    ]);
+                }
+            });
+
+            fclose($handle);
+        }, $filename, [
+            'Content-Type' => 'text/csv; charset=UTF-8',
+        ]);
+    }
+}
