@@ -57,3 +57,19 @@ If you discover a security vulnerability within Laravel, please send an e-mail t
 ## License
 
 The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+
+# 🛡️ Laravel Attendant System v2
+Sistem absensi berbasis web yang dibangun dengan Laravel 12.
+
+## 🚀 Fitur Utama
+- Manajemen perangkat (Device Management)
+- Fingerprint sensor integration (JM-101B)
+- Real-time logging
+
+## 🛠️ Tech Stack
+- **Framework:** Laravel 12
+- **Database:** MySQL
+- **Hardware:** Raspberry Pi 5
+
+## 📸 Screenshots
+![Dashboard](link-gambar-kamu-disini)
