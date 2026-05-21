@@ -14,21 +14,41 @@
   .dash-icon{font-size:1.8rem;color:#4A90E2}
   .dash-value{font-size:2rem;font-weight:700}
   .dash-label{font-size:.85rem;color:#777}
-  .chart-container{width:100%;max-width:400px;margin:0 auto 1rem}
+  
+  /* Styling untuk container chart */
+  .chart-container{position:relative; width:100%; height:300px; margin:0 auto}
+  .dashboard-wrapper { display: flex; flex-direction: column; gap: 2rem; }
+  
   @media(max-width:768px){.dashboard-grid{grid-template-columns:1fr}}
 </style>
 @endpush
 
 @section('content')
+  <div class="dashboard-wrapper">
+    
+    {{-- Panggil komponen Livewire HANYA SEKALI di sini --}}
+    <livewire:dashboard-stats />
 
-  {{-- Panggil komponen Livewire untuk angka yang auto-update --}}
-  <livewire:dashboard-stats />
+    {{-- KARTU CHART BARU --}}
+    @if(auth()->user()->isAdmin())
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-chart-pie"></i> Persentase Kehadiran Hari Ini</h2>
+        </div>
+        <div class="card-body">
+            <div class="chart-container">
+                <canvas id="attendanceChart"></canvas>
+            </div>
+        </div>
+    </div>
+    @endif
 
+  </div>
 @endsection
 
 @push('scripts')
 <script>
-// Fungsi ini tetap kita pakai untuk menampilkan popup daftar nama
+// 1. Fungsi Popup Detail (Tetap seperti sebelumnya)
 async function showDetail(roleLabel, status) {
   const res  = await fetch(`{{ route('dashboard.detail') }}?role=${roleLabel}&status=${status}`, { headers: { Accept: 'application/json' } });
   const rows = await res.json();
@@ -47,5 +67,55 @@ async function showDetail(roleLabel, status) {
       <button class="btn btn-primary btn-sm" onclick="closeModal()">Tutup</button>
     </div>`);
 }
+
+// 2. Fungsi Render Chart.js
+document.addEventListener('DOMContentLoaded', async function() {
+    const canvas = document.getElementById('attendanceChart');
+    if(!canvas) return; // Mencegah error jika login sebagai siswa (canvas disembunyikan)
+    
+    const ctx = canvas.getContext('2d');
+    
+    try {
+        // Ambil data dari API stats
+        const res = await fetch('{{ route("dashboard.stats") }}');
+        const data = await res.json();
+
+        // Inisialisasi Chart.js
+        new Chart(ctx, {
+            type: 'doughnut',
+            data: {
+                labels: ['Hadir', 'Izin', 'Sakit'],
+                datasets: [{
+                    // Menjumlahkan data Siswa + Guru
+                    data: [
+                        (data.siswa.hadir || 0) + (data.guru.hadir || 0), 
+                        (data.siswa.izin || 0) + (data.guru.izin || 0), 
+                        (data.siswa.sakit || 0) + (data.guru.sakit || 0)
+                    ],
+                    backgroundColor: ['#16A34A', '#D97706', '#DC2626'], // Hijau, Oranye, Merah
+                    borderWidth: 0,
+                    hoverOffset: 10
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        position: 'bottom',
+                        labels: {
+                            usePointStyle: true,
+                            padding: 20,
+                            font: { family: 'DM Sans', size: 12 }
+                        }
+                    }
+                },
+                cutout: '75%' // Ukuran lubang donat
+            }
+        });
+    } catch (error) {
+        console.error("Gagal memuat data chart:", error);
+    }
+});
 </script>
 @endpush

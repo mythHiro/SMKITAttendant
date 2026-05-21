@@ -1,5 +1,5 @@
 <div wire:poll.2s>
-    @if($mode === 'siswa')
+    @if($mode === 'siswa' || $mode === 'guru')
         {{-- Kartu Statistik (Kode yang sebelumnya sudah ada) --}}
         <div class="role-section" style="grid-column: 1 / -1; margin-bottom: 2rem;">
             <h3><i class="fas fa-chart-line"></i> Statistik Kehadiran Saya</h3>

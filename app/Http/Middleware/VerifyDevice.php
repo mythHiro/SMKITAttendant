@@ -25,6 +25,8 @@ class VerifyDevice
             return response()->json(['message' => 'Akses ditolak: Device tidak valid atau tidak aktif.'], 403);
         }
 
+        $device->update(['last_seen' => now()]);
+
         return $next($request);
     }
 }

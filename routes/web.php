@@ -341,3 +341,39 @@ Route::get('/generate-device', function () {
     ]);
     return "Berhasil! KODE RAHASIA DEVICE ANDA: <strong>" . $key . "</strong>";
 });
+
+Route::get('/sync-users-lama', function () {
+    $countSiswa = 0;
+    $countGuru = 0;
+
+    // 1. Loop semua data Siswa lama
+    $siswas = \App\Models\Siswa::all();
+    foreach ($siswas as $s) {
+        // firstOrCreate memastikan kalau akun sudah ada, tidak akan dibuat dobel
+        $user = \App\Models\User::firstOrCreate(
+            ['username' => strtolower($s->nis)],
+            [
+                'name'     => $s->nama,
+                'password' => \Illuminate\Support\Facades\Hash::make($s->nis),
+                'role'     => 'siswa'
+            ]
+        );
+        if ($user->wasRecentlyCreated) $countSiswa++;
+    }
+
+    // 2. Loop semua data Guru lama
+    $gurus = \App\Models\Guru::all();
+    foreach ($gurus as $g) {
+        $user = \App\Models\User::firstOrCreate(
+            ['username' => strtolower($g->nip)],
+            [
+                'name'     => $g->nama,
+                'password' => \Illuminate\Support\Facades\Hash::make($g->nip),
+                'role'     => 'guru'
+            ]
+        );
+        if ($user->wasRecentlyCreated) $countGuru++;
+    }
+
+    return "Sinkronisasi Selesai! Berhasil membuat {$countSiswa} akun siswa lama dan {$countGuru} akun guru lama.";
+});

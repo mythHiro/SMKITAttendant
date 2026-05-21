@@ -11,7 +11,7 @@ class DashboardStats extends Component
     {
         $user = auth()->user();
 
-        if ($user->role === 'siswa') {
+        if ($user->role === 'siswa' || $user->role === 'guru') {
             // Ambil total akumulasi untuk kartu
             $rekap = Absensi::where('nama', $user->name)
                 ->selectRaw('status, count(*) as total')
@@ -23,7 +23,7 @@ class DashboardStats extends Component
                 'izin'  => $rekap->get('Izin', 0),
                 'sakit' => $rekap->get('Sakit', 0),
             ];
-            
+
             // Ambil 10 riwayat absensi terbaru milik pribadi
             $logs = Absensi::where('nama', $user->name)
                 ->orderBy('tanggal', 'desc')
@@ -31,17 +31,20 @@ class DashboardStats extends Component
                 ->take(10)
                 ->get();
 
-            $mode = 'siswa';
+            $mode = $user->role; // siswa atau guru
         } else {
-            // MODE ADMIN (Tetap seperti sebelumnya)
+            // MODE ADMIN
             $today = today()->toDateString();
+
             $rekap = Absensi::where('tanggal', $today)
                 ->selectRaw('role_type, status, count(*) as total')
                 ->groupBy('role_type', 'status')
                 ->get();
 
             $build = function (string $roleType) use ($rekap) {
-                $dataRole = $rekap->where('role_type', $roleType)->pluck('total', 'status');
+                $dataRole = $rekap->where('role_type', $roleType)
+                    ->pluck('total', 'status');
+
                 return [
                     'hadir' => $dataRole->get('Hadir', 0),
                     'izin'  => $dataRole->get('Izin', 0),
@@ -53,8 +56,8 @@ class DashboardStats extends Component
                 'siswa' => $build('Siswa'),
                 'guru'  => $build('Guru'),
             ];
-            
-            $logs = collect(); // Admin tidak butuh variabel logs ini di sini
+
+            $logs = collect();
             $mode = 'admin';
         }
 

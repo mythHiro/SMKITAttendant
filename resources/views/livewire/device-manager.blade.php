@@ -32,7 +32,8 @@
             <tr>
                 <th>Nama Perangkat</th>
                 <th>API Key (X-Device-Key)</th>
-                <th>Status</th>
+                <th>Koneksi IoT</th>
+                <th>Akses Alat</th>
                 <th>Aksi</th>
             </tr>
         </thead>
@@ -41,6 +42,24 @@
                 <tr>
                     <td><strong>{{ $device->name }}</strong></td>
                     <td><code style="background: #f4f4f4; padding: 4px 8px; border-radius: 4px; color: #E74C3C; font-weight: bold;">{{ $device->api_key }}</code></td>
+                    
+                    {{-- KOLOM STATUS KONEKSI (BARU) --}}
+                    <td>
+                        {{-- Jika perangkat pernah terhubung dan waktu terakhirnya kurang dari 3 menit yang lalu --}}
+                        @if($device->last_seen && $device->last_seen->diffInMinutes(now()) < 3)
+                            <span class="badge badge-green">
+                                <i class="fas fa-circle" style="font-size: 8px; margin-right: 4px; animation: blink 1.5s infinite;"></i> Online
+                            </span>
+                        @else
+                            <span class="badge badge-red">
+                                <i class="fas fa-circle" style="font-size: 8px; margin-right: 4px;"></i> Offline
+                            </span>
+                            <div style="font-size: 0.7rem; color: #888; margin-top: 4px;">
+                                {{ $device->last_seen ? 'Terakhir: ' . $device->last_seen->diffForHumans() : 'Belum pernah sinkronisasi' }}
+                            </div>
+                        @endif
+                    </td>
+
                     <td>
                         <button wire:click="toggleStatus({{ $device->id }})" class="btn btn-sm {{ $device->is_active ? 'btn-success' : 'btn-warning' }}" style="width: 85px;">
                             <i class="fas {{ $device->is_active ? 'fa-toggle-on' : 'fa-toggle-off' }}"></i> {{ $device->is_active ? 'Aktif' : 'Nonaktif' }}
@@ -53,7 +72,7 @@
                     </td>
                 </tr>
             @empty
-                <tr><td colspan="4" style="text-align: center; color: #777;">Belum ada perangkat IoT yang terdaftar.</td></tr>
+                <tr><td colspan="5" style="text-align: center; color: #777;">Belum ada perangkat IoT yang terdaftar.</td></tr>
             @endforelse
         </tbody>
     </table>

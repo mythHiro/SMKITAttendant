@@ -2,10 +2,12 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\User;
 use App\Models\Siswa;
 use App\Models\Absensi;
 use App\Models\Kategori;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Storage;
 
 class SiswaController extends Controller
@@ -69,6 +71,13 @@ class SiswaController extends Controller
 
         $siswa = Siswa::create($data);
 
+        User::create([
+            'name'     => $request->nama,
+            'username' => strtolower($request->nis), // Jadikan lowercase untuk username
+            'password' => Hash::make($request->nis), // Default password = NIS
+            'role'     => 'siswa',
+        ]);
+
         return response()->json(['message' => 'Data siswa berhasil ditambahkan.', 'siswa' => $siswa], 201);
     }
 
@@ -82,30 +91,47 @@ class SiswaController extends Controller
             'foto_wajah' => 'nullable|image|mimes:jpeg,png,jpg|max:2048',
         ]);
 
+        // Simpan NIS lama sebelum di-update untuk mencari data User
+        $oldNis = $siswa->nis;
+
         $data = $request->only('nis', 'nama', 'kelas', 'jurusan');
 
-        // Jika user mengupload foto baru saat mengedit
         if ($request->hasFile('foto_wajah')) {
-            // Hapus foto lama agar storage tidak penuh dengan file zombie
             if ($siswa->foto_wajah) {
                 Storage::disk('public')->delete($siswa->foto_wajah);
             }
-            // Simpan foto yang baru
             $data['foto_wajah'] = $request->file('foto_wajah')->store('dataset/siswa', 'public');
         }
 
         $siswa->update($data);
+
+        // --- TAMBAHAN POIN 6: SINKRONISASI UPDATE AKUN ---
+        $userAccount = User::where('username', strtolower($oldNis))->where('role', 'siswa')->first();
+        if ($userAccount) {
+            $userAccount->update([
+                'name'     => $request->nama,
+                'username' => strtolower($request->nis),
+                // Password tidak di-update agar tidak mereset password jika siswa sudah menggantinya sendiri
+            ]);
+        }
+        // -------------------------------------------------
 
         return response()->json(['message' => 'Data siswa berhasil diperbarui.', 'siswa' => $siswa]);
     }
 
     public function destroy(Siswa $siswa)
     {
-        // Bersihkan foto di storage terlebih dahulu sebelum data dihapus dari database
         if ($siswa->foto_wajah) {
             Storage::disk('public')->delete($siswa->foto_wajah);
         }
         
+        // --- TAMBAHAN POIN 6: HAPUS AKUN TERKAIT ---
+        $userAccount = User::where('username', strtolower($siswa->nis))->where('role', 'siswa')->first();
+        if ($userAccount) {
+            $userAccount->delete();
+        }
+        // -------------------------------------------
+
         $siswa->delete();
         
         return response()->json(['message' => 'Data siswa berhasil dihapus.']);
