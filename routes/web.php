@@ -67,15 +67,19 @@ Route::middleware('auth')->group(function () {
             $pythonCode = <<<PYTHON
 import os
 import sys
+import signal
 import warnings
+import logging
+import gc
 
-# 1. OPTIMASI ENVIRONMENT (Hapus Redundansi)
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+# ============================================================
+#  OPTIMASI ENVIRONMENT — Wajib sebelum import TF/DeepFace
+# ============================================================
+os.environ['TF_CPP_MIN_LOG_LEVEL']  = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 warnings.filterwarnings('ignore')
-
-import logging
 logging.getLogger('tensorflow').setLevel(logging.FATAL)
+logging.getLogger('deepface').setLevel(logging.FATAL)
 
 try:
     import absl.logging
@@ -88,231 +92,764 @@ import requests
 import threading
 import time
 import shutil
+from collections import deque, Counter
 from deepface import DeepFace
 
-# ==========================================
-# KONFIGURASI SISTEM
-# ==========================================
-CAMERA_INDEX = 0  # FIX: Gunakan index konsisten
-BASE_URL = "http://192.168.249.131:8000" # Ganti dengan IP Laravel-mu
-SYNC_URL = f"{BASE_URL}/api/get-new-faces"
-ATTENDANCE_URL = f"{BASE_URL}/api/absensi"
+# ============================================================
+#  KONFIGURASI — Edit bagian ini saja
+# ============================================================
 
-API_KEY = "	sCgI68gSJBMo9IvnjFmvzP3qodsGaxEP".strip()
-HEADERS = {
-    "X-Device": API_KEY,
+# --- Jaringan ---
+BASE_URL        = "http://127.0.0.1:8000"
+SYNC_URL        = f"{BASE_URL}/api/get-new-faces"
+ATTENDANCE_URL  = f"{BASE_URL}/api/absensi"
+API_KEY         = "" # ISI BAGIAN INI DENGAN X-Device-Key yang sudah di generate!!!!
+HEADERS         = {
+    "X-Device-Key": API_KEY,  # <--- INI YANG DIPERBAIKI
     "Accept": "application/json",
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
 }
-HEADLESS_MODE = False
 
-# FIX: Pastikan folder selalu ada
-DATASET_DIR = "dataset"
-INTRUDER_DIR = "intruders"
+# --- Kamera ---
+#   CAMERA_KEYWORD: nama (sebagian) device yang dicari otomatis.
+#   Jika None atau tidak ditemukan → pakai CAMERA_INDEX_FALLBACK.
+#   Contoh keyword lain: "Logitech", "Integrated", "USB Camera"
+CAMERA_KEYWORD          = "OBSBOT"
+CAMERA_INDEX_FALLBACK   = 0
+CAM_WIDTH               = 1280   # 720p
+CAM_HEIGHT              = 720
+HEADLESS_MODE           = False   # True = tanpa jendela (mode server/Pi headless)
+
+# --- Direktori ---
+DATASET_DIR     = "dataset"
+INTRUDER_DIR    = "intruders"
+
+# --- Model AI ---
+#   Facenet512 lebih akurat untuk dataset banyak orang.
+#   Threshold cosine: 0.30 = default DeepFace (ketat). Naikkan s.d. 0.40 jika
+#   sering false-negative (orang yang terdaftar tidak dikenali).
+MODEL_NAME          = "Facenet512"
+DISTANCE_METRIC     = "cosine"
+DISTANCE_THRESHOLD  = 0.35
+
+#   DETECTOR_CHAIN: urutan detector yang dicoba per-frame.
+#   Sistem akan otomatis turun ke level berikutnya jika detector gagal deteksi.
+#
+#   "retinaface" → akurasi tertinggi, support angle ekstrem  (butuh pip install retina-face)
+#   "mtcnn"      → bagus, lebih ringan dari retinaface        (butuh pip install mtcnn)
+#   "opencv"     → paling ringan, kadang "buta" angle miring
+#
+#   Rekomendasi laptop/PC kuat: ["retinaface", "mtcnn", "opencv"]
+#   Rekomendasi Raspberry Pi   : ["mtcnn", "opencv"]
+DETECTOR_CHAIN  = ["retinaface", "mtcnn", "opencv"]
+
+# --- FaceTracker (Sistem Voting Multi-Frame) ---
+VOTE_WINDOW             = 6     # Ukuran sliding window (frame)
+MIN_VOTES_TO_CONFIRM    = 3     # Minimal vote sebelum identitas dikunci
+KNOWN_CONFIRM_RATIO     = 0.60  # ≥60% vote sepakat → "dikenal"
+UNKNOWN_CONFIRM_RATIO   = 0.55  # ≥55% vote unknown → "tidak terdaftar"
+TRACK_TIMEOUT_SEC       = 4.0   # Track dihapus jika tidak terlihat N detik
+IOU_MATCH_THRESHOLD     = 0.25  # Minimal IoU untuk mencocokkan track ke deteksi baru
+
+# --- Performa & Keamanan ---
+ATTENDANCE_COOLDOWN     = 60    # Detik jeda absensi per orang
+INTRUDER_COOLDOWN       = 15    # Detik jeda foto penyusup
+SYNC_INTERVAL           = 60    # Detik antar sinkronisasi server
+PROCESS_EVERY_N_FRAMES  = 8     # Jalankan AI setiap N frame
+MAX_COOLDOWN_ENTRIES    = 500   # Batas entry cooldown (cegah memory leak)
+
+# ============================================================
 os.makedirs(DATASET_DIR, exist_ok=True)
 os.makedirs(INTRUDER_DIR, exist_ok=True)
 
-last_sync_status = ""
-last_attendance_sent = {}
-unknown_counter = 0
-last_intruder_time = 0
+# ============================================================
+#  AUTO-DETECT KAMERA
+# ============================================================
 
-# ==========================================
-# WORKER: PENGIRIMAN ABSENSI (Mencegah Thread Spam)
-# ==========================================
-def send_attendance(name):
+def list_cameras_windows() -> dict[int, str]:
+    """
+    Baca nama device kamera di Windows menggunakan pygrabber.
+    Return: {index: nama_device}
+    """
     try:
-        data = {"nama": name, "role_type": "Siswa"}
-        response = requests.post(ATTENDANCE_URL, json=data, headers=HEADERS, timeout=10)
-        if response.status_code in [200, 201]:
-            print(f"[ABSENSI] SUKSES: {name} berhasil diabsen!")
-        else:
-            print(f"[ABSENSI] Gagal: {response.json().get('message', 'Error')}")
-    except Exception as e:
-        print(f"[ABSENSI] Error jaringan saat mengirim absen {name}.")
+        from pygrabber.dshow_graph import FilterGraph
+        graph   = FilterGraph()
+        devices = graph.get_input_devices()
+        return {i: name for i, name in enumerate(devices)}
+    except ImportError:
+        return {}
+    except Exception:
+        return {}
 
-# ==========================================
-# WORKER: SINKRONISASI DATA WAJAH
-# ==========================================
+
+def find_camera_index(keyword: str | None, fallback: int) -> tuple[int, str]:
+    """
+    Cari kamera berdasarkan keyword nama device.
+    Return: (index, nama_device)
+
+    Langkah:
+      1. Coba baca nama device via pygrabber (Windows).
+      2. Jika tidak bisa, scan index 0–9 dan cek yang bisa dibuka.
+      3. Fallback ke CAMERA_INDEX_FALLBACK.
+    """
+    if keyword:
+        # Coba via pygrabber (nama asli device)
+        devices = list_cameras_windows()
+        if devices:
+            print("[KAMERA] Device yang terdeteksi:")
+            for idx, name in devices.items():
+                mark = "  ← target" if keyword.lower() in name.lower() else ""
+                print(f"         [{idx}] {name}{mark}")
+
+            for idx, name in devices.items():
+                if keyword.lower() in name.lower():
+                    print(f"[KAMERA] ✓ '{name}' dipilih (index {idx})")
+                    return idx, name
+
+            print(f"[KAMERA] ⚠ Keyword '{keyword}' tidak ditemukan di device list.")
+
+        else:
+            # pygrabber tidak tersedia → scan manual + print info
+            print("[KAMERA] pygrabber tidak tersedia, scan kamera manual...")
+            print("[KAMERA] Install pygrabber untuk auto-detect nama: pip install pygrabber")
+            found = []
+            for i in range(8):
+                cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+                if cap.isOpened():
+                    found.append(i)
+                    cap.release()
+            if found:
+                print(f"[KAMERA] Index kamera yang terbuka: {found}")
+                print(f"[KAMERA] Tidak bisa baca nama device. Pakai CAMERA_INDEX_FALLBACK = {fallback}")
+
+    print(f"[KAMERA] Menggunakan fallback index: {fallback}")
+    return fallback, f"Camera [{fallback}]"
+
+
+# ============================================================
+#  DATASET VALIDATOR
+# ============================================================
+
+def validate_dataset_background():
+    """
+    Scan semua gambar di dataset, coba deteksi wajah.
+    Jalankan di background thread saat startup agar tidak block program.
+    Gambar bermasalah hanya di-warning, tidak dihapus otomatis.
+    """
+    def _run():
+        print("[DATASET] Memulai validasi dataset...")
+        bad   = []
+        total = 0
+
+        for person in sorted(os.listdir(DATASET_DIR)):
+            person_dir = os.path.join(DATASET_DIR, person)
+            if not os.path.isdir(person_dir):
+                continue
+
+            imgs = [
+                f for f in os.listdir(person_dir)
+                if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+            ]
+
+            for img_file in imgs:
+                total += 1
+                img_path = os.path.join(person_dir, img_file)
+
+                ok = False
+                # Coba dengan setiap detector di chain
+                for detector in DETECTOR_CHAIN:
+                    try:
+                        DeepFace.extract_faces(
+                            img_path         = img_path,
+                            detector_backend = detector,
+                            enforce_detection = True,
+                        )
+                        ok = True
+                        break   # Berhasil → tidak perlu coba detector berikutnya
+                    except ValueError:
+                        continue    # Detector ini gagal, coba berikutnya
+                    except Exception:
+                        continue
+
+                if not ok:
+                    bad.append(img_path)
+
+        if not bad:
+            print(f"[DATASET] ✓ Semua {total} gambar valid (wajah terdeteksi).")
+        else:
+            print(f"[DATASET] ⚠ {len(bad)}/{total} gambar bermasalah (wajah tidak terdeteksi):")
+            for p in bad:
+                print(f"          → {p}")
+            print("[DATASET]   Saran: ganti foto tsb dengan foto wajah yang lebih jelas,")
+            print("[DATASET]   terang, dan menghadap depan.")
+
+    threading.Thread(target=_run, daemon=True, name="DatasetValidator").start()
+
+
+# ============================================================
+#  FACE TRACKER
+# ============================================================
+
+def compute_iou(b1: tuple, b2: tuple) -> float:
+    x1, y1, w1, h1 = b1
+    x2, y2, w2, h2 = b2
+    inter_x = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
+    inter_y = max(0, min(y1 + h1, y2 + h2) - max(y1, y2))
+    inter   = inter_x * inter_y
+    union   = w1 * h1 + w2 * h2 - inter
+    return inter / union if union > 0 else 0.0
+
+
+class FaceTrack:
+    """
+    Melacak satu wajah lintas frame.
+    Identitas dikunci via voting sliding window — bukan dari 1 frame tunggal.
+
+    Status:
+      "pending"       — belum cukup vote
+      "dikenal"       — terkonfirmasi ada di dataset
+      "tidak_dikenal" — terkonfirmasi tidak terdaftar
+    """
+    _counter = 0
+
+    def __init__(self, bbox, name, known, dist):
+        FaceTrack._counter += 1
+        self.id             = FaceTrack._counter
+        self.bbox           = bbox
+        self.votes          = deque(maxlen=VOTE_WINDOW)
+        self.last_seen      = time.time()
+        self.confirmed_name = None
+        self.status         = "pending"
+        self.confidence     = 0.0
+        self._add_vote(name, known, dist)
+
+    def _add_vote(self, name, known, dist):
+        self.votes.append((name, known, dist))
+        self.last_seen = time.time()
+        self._recompute()
+
+    def update(self, bbox, name, known, dist):
+        self.bbox = bbox
+        self._add_vote(name, known, dist)
+
+    def touch(self, bbox):
+        """Update posisi tanpa vote baru (frame tanpa rekognisi)."""
+        self.bbox       = bbox
+        self.last_seen  = time.time()
+
+    def _recompute(self):
+        n = len(self.votes)
+        if n < MIN_VOTES_TO_CONFIRM:
+            self.status     = "pending"
+            self.confidence = 0.0
+            return
+
+        known_votes   = [(nm, d) for nm, k, d in self.votes if k]
+        unknown_count = sum(1 for _, k, _ in self.votes if not k)
+
+        if len(known_votes) / n >= KNOWN_CONFIRM_RATIO:
+            best, cnt = Counter(nm for nm, _ in known_votes).most_common(1)[0]
+            self.confirmed_name = best
+            self.confidence     = cnt / n
+            self.status         = "dikenal"
+        elif unknown_count / n >= UNKNOWN_CONFIRM_RATIO:
+            self.confirmed_name = "TIDAK TERDAFTAR"
+            self.confidence     = unknown_count / n
+            self.status         = "tidak_dikenal"
+        else:
+            self.status         = "pending"
+            self.confidence     = 0.0
+
+    def is_stale(self) -> bool:
+        return time.time() - self.last_seen > TRACK_TIMEOUT_SEC
+
+    @property
+    def label(self) -> str:
+        if self.status == "dikenal":
+            return f"{self.confirmed_name} ({self.confidence*100:.0f}%)"
+        elif self.status == "tidak_dikenal":
+            return f"TIDAK TERDAFTAR ({self.confidence*100:.0f}%)"
+        return "Mengidentifikasi..."
+
+    @property
+    def color(self) -> tuple:
+        """BGR color untuk bounding box."""
+        if self.status == "dikenal":        return (30, 200, 30)   # Hijau
+        elif self.status == "tidak_dikenal": return (30, 30, 210)  # Merah
+        return (30, 180, 240)                                       # Kuning (pending)
+
+
+class FaceTrackerManager:
+    def __init__(self):
+        self._tracks: dict[int, FaceTrack] = {}
+        self._lock = threading.Lock()
+
+    def update(self, detections: list) -> list[FaceTrack]:
+        with self._lock:
+            # Bersihkan track stale
+            for tid in [t for t, tr in self._tracks.items() if tr.is_stale()]:
+                del self._tracks[tid]
+
+            matched_tracks = set()
+            matched_dets   = set()
+
+            # Cocokkan deteksi ke track yang ada (IoU)
+            for tid, track in self._tracks.items():
+                best_iou, best_i = IOU_MATCH_THRESHOLD, -1
+                for i, det in enumerate(detections):
+                    if i in matched_dets:
+                        continue
+                    iou = compute_iou(track.bbox, det["bbox"])
+                    if iou > best_iou:
+                        best_iou, best_i = iou, i
+                if best_i >= 0:
+                    d = detections[best_i]
+                    track.update(d["bbox"], d["name"], d["known"], d["dist"])
+                    matched_tracks.add(tid)
+                    matched_dets.add(best_i)
+
+            # Deteksi baru yang tidak cocok ke track mana pun → track baru
+            for i, d in enumerate(detections):
+                if i not in matched_dets:
+                    t = FaceTrack(d["bbox"], d["name"], d["known"], d["dist"])
+                    self._tracks[t.id] = t
+
+            return list(self._tracks.values())
+
+    def get_all(self) -> list[FaceTrack]:
+        with self._lock:
+            return list(self._tracks.values())
+
+
+# ============================================================
+#  DETECTOR DENGAN FALLBACK CHAIN
+# ============================================================
+
+_last_working_detector = DETECTOR_CHAIN[0]
+
+def deepface_find_with_fallback(frame) -> tuple[list, str]:
+    """
+    Coba DeepFace.find dengan setiap detector di DETECTOR_CHAIN.
+    Mulai dari detector yang terakhir berhasil (cache), bukan selalu dari awal.
+
+    Return: (results, detector_yang_dipakai)
+    Raise ValueError  jika semua detector tidak menemukan wajah.
+    Raise RuntimeError jika semua detector error bukan karena "no face".
+    """
+    global _last_working_detector
+
+    # Susun urutan: detektor terakhir yang berhasil didahulukan
+    chain = [_last_working_detector] + [
+        d for d in DETECTOR_CHAIN if d != _last_working_detector
+    ]
+
+    last_exc = None
+    for detector in chain:
+        try:
+            results = DeepFace.find(
+                img_path            = frame,
+                db_path             = DATASET_DIR,
+                model_name          = MODEL_NAME,
+                distance_metric     = DISTANCE_METRIC,
+                detector_backend    = detector,
+                enforce_detection   = True,
+                silent              = True,
+            )
+            _last_working_detector = detector   # Simpan yang berhasil
+            return results, detector
+
+        except ValueError as e:
+            # "Face could not be detected" — tidak ada wajah di frame ini
+            # Ini bukan error program, cukup return kosong
+            raise ValueError(str(e)) from None
+
+        except Exception as e:
+            # Detector gagal karena alasan lain (model belum didownload, dll)
+            last_exc = e
+            continue
+
+    # Semua detector gagal
+    raise RuntimeError(
+        f"Semua detector gagal. Error terakhir: {last_exc}"
+    )
+
+
+# ============================================================
+#  STATE GLOBAL
+# ============================================================
+shutdown_event  = threading.Event()
+state_lock      = threading.Lock()
+dataset_lock    = threading.RLock()
+
+last_sync_status            = ""
+last_attendance_sent: dict  = {}
+last_intruder_time          = 0.0
+
+recognition_result: list    = []
+recognition_running         = False
+active_detector_display     = DETECTOR_CHAIN[0]  # Ditampilkan di HUD
+
+tracker = FaceTrackerManager()
+
+# ============================================================
+#  GRACEFUL SHUTDOWN
+# ============================================================
+def handle_shutdown(signum, _frame):
+    print("\n[SISTEM] Shutdown...")
+    shutdown_event.set()
+
+signal.signal(signal.SIGINT,  handle_shutdown)
+signal.signal(signal.SIGTERM, handle_shutdown)
+
+# ============================================================
+#  WORKER: ABSENSI
+# ============================================================
+def _do_send(name: str):
+    try:
+        r = requests.post(
+            ATTENDANCE_URL,
+            json    = {"nama": name, "role_type": "Siswa"},
+            headers = HEADERS,
+            timeout = 10,
+        )
+        if r.status_code in (200, 201):
+            print(f"[ABSENSI] ✓ {name}")
+        else:
+            print(f"[ABSENSI] ✗ {name} → {r.json().get('message', r.status_code)}")
+    except requests.exceptions.Timeout:
+        print(f"[ABSENSI] ✗ Timeout: {name}")
+    except requests.exceptions.ConnectionError:
+        print(f"[ABSENSI] ✗ Server tidak terjangkau: {name}")
+    except Exception as e:
+        print(f"[ABSENSI] ✗ Error: {e}")
+
+
+def try_send_attendance(name: str):
+    now = time.time()
+    with state_lock:
+        if now - last_attendance_sent.get(name, 0) <= ATTENDANCE_COOLDOWN:
+            return
+            
+        last_attendance_sent[name] = now
+        
+        # Jauh lebih ringan: Hapus 50 entri terlama tanpa di-sort
+        if len(last_attendance_sent) > MAX_COOLDOWN_ENTRIES:
+            for _ in range(50):
+                # Ambil kunci paling pertama (paling lama dimasukkan) lalu hapus
+                oldest_key = next(iter(last_attendance_sent))
+                del last_attendance_sent[oldest_key]
+                
+    threading.Thread(target=_do_send, args=(name,), daemon=True).start()
+
+
+# ============================================================
+#  WORKER: SINKRONISASI DATASET
+# ============================================================
 def sync_faces_with_server():
     global last_sync_status
-    while True:
+    while not shutdown_event.is_set():
         try:
-            response = requests.get(SYNC_URL, headers=HEADERS, timeout=(5, 15))
-            if response.status_code == 200:
-                data = response.json()
-                users_data = data.get('users', [])
+            resp       = requests.get(SYNC_URL, headers=HEADERS, timeout=(5, 15))
+            users_data = resp.json().get("users", []) if resp.status_code == 200 else []
 
-                if not users_data and last_sync_status != "empty":
-                    print("[SYNC] Tersambung, namun belum ada data wajah di server.")
-                    last_sync_status = "empty"
-                elif users_data:
-                    if last_sync_status not in ["ok", "empty"]:
-                        print("[SYNC] Berhasil terhubung ke server.")
-                    last_sync_status = "ok"
+            with dataset_lock:
+                if resp.status_code != 200:
+                    print(f"[SYNC] Kode server: {resp.status_code}")
+                else:
+                    server_names = {u["name"] for u in users_data}
+                    new_added = deleted = False
 
-                new_data_added = False
-                data_deleted = False
-                server_users = [user['name'] for user in users_data]
+                    if not users_data and last_sync_status != "empty":
+                        print("[SYNC] Tersambung, belum ada data wajah di server.")
+                        last_sync_status = "empty"
+                    elif users_data and last_sync_status not in ("ok", "empty"):
+                        print("[SYNC] Terhubung ke server.")
 
-                # Download wajah baru
-                for user in users_data:
-                    user_dir = os.path.join(DATASET_DIR, user['name'])
-                    os.makedirs(user_dir, exist_ok=True)
-                    img_path = os.path.join(user_dir, user['filename'])
-                    
-                    if not os.path.exists(img_path):
-                        print(f"[SYNC] Mengunduh wajah baru: {user['name']}...")
-                        try:
-                            img_data = requests.get(user['image_url'], timeout=(2, 10)).content
-                            with open(img_path, 'wb') as handler:
-                                handler.write(img_data)
-                            new_data_added = True
-                        except Exception as e:
-                            print(f"[SYNC] Gagal mengunduh foto {user['name']}: {e}")
+                    # Download wajah baru
+                    for u in users_data:
+                        udir = os.path.join(DATASET_DIR, u["name"])
+                        os.makedirs(udir, exist_ok=True)
+                        ipath = os.path.join(udir, u["filename"])
+                        if not os.path.exists(ipath):
+                            print(f"[SYNC] Unduh: {u['name']}...")
+                            try:
+                                data = requests.get(u["image_url"], timeout=(2, 10)).content
+                                with open(ipath, "wb") as f:
+                                    f.write(data)
+                                new_added = True
+                            except Exception as e:
+                                print(f"[SYNC] Gagal unduh {u['name']}: {e}")
 
-                # Hapus wajah usang
-                local_users = [d for d in os.listdir(DATASET_DIR) if os.path.isdir(os.path.join(DATASET_DIR, d))]
-                for local_user in local_users:
-                    if local_user not in server_users:
-                        print(f"[SYNC] Menghapus wajah kadaluarsa: {local_user}...")
-                        shutil.rmtree(os.path.join(DATASET_DIR, local_user))
-                        data_deleted = True
+                    # Hapus kadaluarsa
+                    for local in os.listdir(DATASET_DIR):
+                        lpath = os.path.join(DATASET_DIR, local)
+                        if os.path.isdir(lpath) and local not in server_names:
+                            print(f"[SYNC] Hapus kadaluarsa: {local}")
+                            shutil.rmtree(lpath)
+                            deleted = True
 
-                # FIX: Penghapusan Cache .pkl yang lebih aman dan mendalam
-                if new_data_added or data_deleted:
-                    pkl_deleted = False
-                    for root, dirs, files in os.walk(DATASET_DIR):
-                        for file in files:
-                            if file.endswith(".pkl"):
-                                os.remove(os.path.join(root, file))
-                                pkl_deleted = True
-                    if pkl_deleted:
-                        print("[SYNC] Cache DeepFace (.pkl) berhasil diperbarui.")
+                    # Bersihkan cache .pkl
+                    if new_added or deleted:
+                        n = sum(
+                            1 for r, _, fs in os.walk(DATASET_DIR)
+                            for f in fs if f.endswith(".pkl")
+                            for _ in [os.remove(os.path.join(r, f))]
+                        )
+                        if n:
+                            print(f"[SYNC] Cache diperbarui ({n} .pkl dihapus).")
+
+                    if users_data:
+                        last_sync_status = "ok"
 
         except requests.exceptions.Timeout:
             if last_sync_status != "timeout":
-                print("[SYNC] Gagal: Koneksi timeout.")
+                print("[SYNC] Timeout.")
                 last_sync_status = "timeout"
         except requests.exceptions.ConnectionError:
             if last_sync_status != "disconnected":
-                print("[SYNC] Gagal: Tidak ada internet/server mati.")
+                print("[SYNC] Server tidak terjangkau.")
                 last_sync_status = "disconnected"
+        except Exception as e:
+            print(f"[SYNC] Error: {e}")
 
-        time.sleep(60)
+        shutdown_event.wait(timeout=SYNC_INTERVAL)
 
-# Jalankan Sync di Background
-threading.Thread(target=sync_faces_with_server, daemon=True).start()
 
-# ==========================================
-# MAIN LOOP: DETEKSI KAMERA & RECOGNITION
-# ==========================================
-cap = cv2.VideoCapture(CAMERA_INDEX)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+# ============================================================
+#  WORKER: REKOGNISI WAJAH
+# ============================================================
+def run_recognition(frame_copy):
+    global recognition_result, recognition_running, last_intruder_time, active_detector_display
+
+    try:
+        scale_factor = 0.5 
+        small_frame = cv2.resize(frame_copy, (0, 0), fx=scale_factor, fy=scale_factor)
+
+        with dataset_lock:
+            has_data = any(
+                os.path.isdir(os.path.join(DATASET_DIR, d))
+                for d in os.listdir(DATASET_DIR)
+            )
+        if not has_data:
+            tracker.update([])
+            with state_lock:
+                recognition_result  = []
+                recognition_running = False
+            return
+
+        # --- Rekognisi dengan fallback detector ---
+        with dataset_lock:
+            results, used_detector = deepface_find_with_fallback(small_frame)
+
+        with state_lock:
+            active_detector_display = used_detector
+
+        raw_dets    = []
+        current_time = time.time()
+
+        for face_df in results:
+            x = y = w = h = 0
+
+            if not face_df.empty:
+                row = face_df.iloc[0]
+                if "source_x" in row.index:
+                    # --- BAGIAN YANG DIUBAH ---
+                    # Karena sebelumnya gambar diperkecil (misal scale_factor = 0.5), 
+                    # maka koordinat X, Y, W, H dari AI juga ikut mengecil.
+                    # Kita harus membaginya dengan scale_factor agar ukurannya 
+                    # kembali besar dan pas di gambar aslinya.
+                    x = int(row["source_x"] / scale_factor)
+                    y = int(row["source_y"] / scale_factor)
+                    w = int(row["source_w"] / scale_factor)
+                    h = int(row["source_h"] / scale_factor)
+                    # --------------------------
+                    
+                dist  = float(row["distance"])
+                known = dist <= DISTANCE_THRESHOLD
+                name  = (
+                    os.path.basename(os.path.dirname(str(row["identity"])))
+                    if known else "TIDAK TERDAFTAR"
+                )
+                if not known:
+                    dist = 1.0
+            else:
+                name, known, dist = "TIDAK TERDAFTAR", False, 1.0   
+
+            raw_dets.append({"bbox": (x, y, w, h), "name": name, "known": known, "dist": dist})
+
+        # Update tracker
+        active_tracks = tracker.update(raw_dets)
+
+        # Buat data render + kirim absensi
+        render = []
+        for t in active_tracks:
+            render.append({"bbox": t.bbox, "label": t.label, "color": t.color, "status": t.status})
+            if t.status == "dikenal" and t.confirmed_name:
+                try_send_attendance(t.confirmed_name)
+
+        # Foto penyusup (hanya jika track TERKONFIRMASI tidak terdaftar)
+        with state_lock:
+            has_intruder = any(t.status == "tidak_dikenal" for t in active_tracks)
+            if has_intruder and (current_time - last_intruder_time > INTRUDER_COOLDOWN):
+                ts   = time.strftime("%Y%m%d_%H%M%S")
+                path = os.path.join(INTRUDER_DIR, f"intruder_{ts}.jpg")
+                cv2.imwrite(path, frame_copy)
+                print(f"[KEAMANAN] ⚠ Penyusup terekam: {path}")
+                last_intruder_time = current_time
+
+        with state_lock:
+            recognition_result = render
+
+    except ValueError:
+        # Tidak ada wajah di frame — ini normal, bukan error
+        tracker.update([])
+        with state_lock:
+            recognition_result = []
+
+    except RuntimeError as e:
+        # Semua detector di chain gagal (bukan karena tidak ada wajah)
+        print(f"[RECOGNITION] ⚠ {e}")
+        with state_lock:
+            recognition_result = []
+
+    except Exception as e:
+        print(f"[RECOGNITION] Error: {type(e).__name__}: {e}")
+        with state_lock:
+            recognition_result = []
+
+    finally:
+        with state_lock:
+            recognition_running = False
+        gc.collect()
+
+# ============================================================
+#  RENDER HELPER
+# ============================================================
+def draw_face_box(frame, bbox, label, color):
+    x, y, w, h = bbox
+    if w <= 0 or h <= 0:
+        return
+
+    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+
+    font        = cv2.FONT_HERSHEY_SIMPLEX
+    fscale      = 0.55
+    thick       = 1
+    (tw, th), _ = cv2.getTextSize(label, font, fscale, thick)
+    ly          = y - 10 if y - 10 > 20 else y + h + 22
+
+    cv2.rectangle(frame, (x, ly - th - 6), (x + tw + 8, ly + 2), color, -1)
+    cv2.putText(frame, label, (x + 4, ly - 3), font, fscale,
+                (255, 255, 255), thick, cv2.LINE_AA)
+
+
+def draw_hud(frame, sync_status, track_count, detector_name):
+    h, _ = frame.shape[:2]
+    s_color = (30, 200, 30) if sync_status == "ok" else (30, 120, 255)
+    cv2.putText(frame, f"Server: {sync_status or 'init'}",
+                (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, s_color, 1, cv2.LINE_AA)
+    cv2.putText(frame, f"Wajah terdeteksi: {track_count}",
+                (8, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(frame, f"{MODEL_NAME} | detector: {detector_name} | thr={DISTANCE_THRESHOLD}",
+                (8, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (120, 120, 120), 1, cv2.LINE_AA)
+
+
+# ============================================================
+#  INISIALISASI
+# ============================================================
+
+# 1. Cari kamera OBSBOT (atau fallback)
+cam_index, cam_name = find_camera_index(CAMERA_KEYWORD, CAMERA_INDEX_FALLBACK)
+
+# 2. Buka kamera
+cap = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)   # CAP_DSHOW lebih stabil di Windows
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,   CAM_WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT,  CAM_HEIGHT)
+cap.set(cv2.CAP_PROP_BUFFERSIZE,    1)
+
+if not cap.isOpened():
+    print(f"[KAMERA] FATAL: Tidak dapat membuka '{cam_name}' (index {cam_index}).")
+    sys.exit(1)
+
+actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+print(f"\n[SISTEM] ═══ Face-Attendant ULTIMATE v3 ═══")
+print(f"[SISTEM] Kamera   : {cam_name} (index {cam_index})")
+print(f"[SISTEM] Resolusi : {actual_w}×{actual_h}")
+print(f"[SISTEM] Model    : {MODEL_NAME} ({DISTANCE_METRIC}, threshold={DISTANCE_THRESHOLD})")
+print(f"[SISTEM] Detector : {' → '.join(DETECTOR_CHAIN)} (fallback otomatis)")
+print(f"[SISTEM] Voting   : window={VOTE_WINDOW} frame, confirm={MIN_VOTES_TO_CONFIRM}")
+print(f"[SISTEM] Headless : {'ON' if HEADLESS_MODE else 'OFF'} | Tekan 'q' untuk keluar.\n")
+
+# 3. Jalankan background threads
+threading.Thread(target=sync_faces_with_server, daemon=True, name="SyncThread").start()
+validate_dataset_background()   # Scan dataset, warning jika ada gambar bermasalah
 
 frame_count = 0
-process_every_n_frames = 10 # FIX: Diubah ke 10 agar tracking lebih smooth
-detected_faces = [] # FIX: Cegah current_name saling timpa
 
-print(f"[KAMERA] Sistem Aktif. Mode Headless: {'ON' if HEADLESS_MODE else 'OFF'}")
-
-while True:
+# ============================================================
+#  MAIN LOOP
+# ============================================================
+while not shutdown_event.is_set():
     ret, frame = cap.read()
+
     if not ret:
-        print("[KAMERA] Gagal membaca frame. Mencoba reconnect...")
+        print("[KAMERA] Gagal baca frame. Reconnect...")
         cap.release()
-        time.sleep(2)
-        cap = cv2.VideoCapture(CAMERA_INDEX) # FIX: Gunakan index yang sama
+        shutdown_event.wait(timeout=2)
+        if shutdown_event.is_set():
+            break
+        cap = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+        if not cap.isOpened():
+            print("[KAMERA] Reconnect gagal, coba lagi 5 detik...")
+            shutdown_event.wait(timeout=5)
         continue
 
     frame_count += 1
-    current_time = time.time()
 
-    # Eksekusi AI hanya setiap n frame
-    if frame_count % process_every_n_frames == 0:
-        detected_faces = [] # Reset data wajah di frame ini
-        
-        has_face_folders = any(os.path.isdir(os.path.join(DATASET_DIR, f)) for f in os.listdir(DATASET_DIR))
-        
-        if has_face_folders:
-            try:
-                # FIX: enforce_detection=True agar tidak mendeteksi objek acak
-                results = DeepFace.find(
-                    img_path=frame,
-                    db_path=DATASET_DIR,
-                    model_name="Facenet",
-                    enforce_detection=True, 
-                    silent=True
-                )
+    # Spawn thread rekognisi setiap N frame (non-blocking)
+    with state_lock:
+        can_run = (frame_count % PROCESS_EVERY_N_FRAMES == 0) and not recognition_running
 
-                faces_detected_and_known = False
+    if can_run:
+        with state_lock:
+            recognition_running = True
+        threading.Thread(
+            target = run_recognition,
+            args   = (frame.copy(),),
+            daemon = True,
+            name   = "RecognitionThread",
+        ).start()
 
-                for face_match in results:
-                    if not face_match.empty:
-                        matched_row = face_match.iloc[0]
-                        distance = matched_row["distance"]
-
-                        # FIX: Threshold Facenet (Cegah False Positive)
-                        if distance > 0.4:
-                            continue 
-
-                        faces_detected_and_known = True
-                        current_name = os.path.basename(os.path.dirname(matched_row["identity"]))
-                        
-                        # FIX: Simpan koordinat ke dalam array
-                        x, y, w, h = 0, 0, 0, 0
-                        if "source_x" in matched_row:
-                            x, y, w, h = (
-                                int(matched_row["source_x"]), int(matched_row["source_y"]),
-                                int(matched_row["source_w"]), int(matched_row["source_h"])
-                            )
-                        
-                        detected_faces.append({
-                            "name": current_name,
-                            "coords": (x, y, w, h)
-                        })
-
-                        # Gembok Waktu Absensi (Cooldown 60 detik per orang)
-                        if current_time - last_attendance_sent.get(current_name, 0) > 60:
-                            last_attendance_sent[current_name] = current_time 
-                            # FIX: Hanya 1 Thread yang dipanggil di sini
-                            threading.Thread(target=send_attendance, args=(current_name,), daemon=True).start()
-
-                # LOGIKA INTRUDER
-                if faces_detected_and_known:
-                    unknown_counter = 0 
-                else:
-                    unknown_counter += 1
-                    if unknown_counter >= 3 and (current_time - last_intruder_time > 15):
-                        timestamp = time.strftime("%Y%md_%H%M%S")
-                        intruder_filename = os.path.join(INTRUDER_DIR, f"intruder_{timestamp}.jpg")
-                        cv2.imwrite(intruder_filename, frame)
-                        print(f"[KEAMANAN] Penyusup terekam: {intruder_filename}")
-                        last_intruder_time = current_time
-                        unknown_counter = 0
-
-            except ValueError:
-                # Tidak ada wajah (enforce_detection=True akan melempar error ini jika kosong)
-                unknown_counter = 0
-            except Exception as e:
-                pass
-
-    # RENDER UI (Menggunakan data dari array detected_faces)
+    # Render
     if not HEADLESS_MODE:
-        for face in detected_faces:
-            x, y, w, h = face["coords"]
-            if w > 0:
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                cv2.putText(frame, face["name"], (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        
-        cv2.imshow("Face Recognition Scanner", frame)
+        with state_lock:
+            to_render    = list(recognition_result)
+            sync_stat    = last_sync_status
+            cur_detector = active_detector_display
+
+        for face in to_render:
+            draw_face_box(frame, face["bbox"], face["label"], face["color"])
+
+        draw_hud(frame, sync_stat, len(to_render), cur_detector)
+
+        cv2.imshow("Face-Attendant v3", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
+            shutdown_event.set()
             break
 
+# ============================================================
+#  CLEANUP
+# ============================================================
+print("[SISTEM] Menutup sistem...")
 cap.release()
 cv2.destroyAllWindows()
+print("[SISTEM] Selesai.")
+
 PYTHON;
 
             return response()->streamDownload(function () use ($pythonCode) {
